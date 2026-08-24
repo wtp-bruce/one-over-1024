@@ -383,10 +383,12 @@ io.on("connection", (socket) => {
   });
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-  const ip = getLanIPv4();
-  console.log(`1/1024 server listening on http://0.0.0.0:${PORT}`);
-  console.log(`LAN join URL: http://${ip}:${PORT}`);
-});
+if (!process.env.VERCEL) {
+  server.listen(PORT, "0.0.0.0", () => {
+    const ip = getLanIPv4();
+    console.log(`1/1024 server listening on http://0.0.0.0:${PORT}`);
+    console.log(`LAN join URL: http://${ip}:${PORT}`);
+  });
+}
 
 export default server;

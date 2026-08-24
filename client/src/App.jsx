@@ -122,7 +122,8 @@ export default function App() {
     if (!joined || !username) return;
     const s = io({
       withCredentials: true,
-      transports: ["websocket", "polling"],
+      // Vercel WebSockets require websocket-only (no long-polling upgrade).
+      transports: ["websocket"],
     });
     setSocket(s);
 
