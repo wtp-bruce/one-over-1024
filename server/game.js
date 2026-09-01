@@ -13,8 +13,10 @@ function emptyBuddy() {
   };
 }
 
-export function createGame() {
+export function createGame(roomCode, creatorId) {
   return {
+    roomCode: roomCode || null,
+    creatorId: creatorId || null,
     // lobby | answering | buddy | revealed | finished
     phase: "lobby",
     round: 0,
@@ -33,8 +35,15 @@ function connectedPlayers(game) {
   return [...game.players.values()].filter((p) => p.connected);
 }
 
+/** Everyone still in the room (online or offline) — used so reconnecting players are not skipped. */
+function rosterPlayers(game) {
+  return [...game.players.values()];
+}
+
 function allAnswerReady(game) {
-  return connectedPlayers(game).every((p) => {
+  const roster = rosterPlayers(game);
+  if (roster.length === 0) return false;
+  return roster.every((p) => {
     const s = game.submissions.get(p.id);
     return s && (s.answer === "A" || s.answer === "B") && s.prediction;
   });
@@ -159,7 +168,9 @@ function canOddAttachNow(game) {
 }
 
 function allBuddyReady(game) {
-  return connectedPlayers(game).every((p) => {
+  const roster = rosterPlayers(game);
+  if (roster.length === 0) return false;
+  return roster.every((p) => {
     const s = game.submissions.get(p.id);
     return (
       s &&
@@ -205,7 +216,6 @@ export function publicState(game, viewerId = null) {
     answerHistory: p.answerHistory,
   }));
 
-  const controllerId = getControllerId(game);
   const submissions = {};
   for (const [id, sub] of game.submissions) {
     const answerReady = !!(sub.answer && sub.prediction);
@@ -233,13 +243,17 @@ export function publicState(game, viewerId = null) {
     submissions[id] = entry;
   }
 
+  const hostId = getHostId(game);
   return {
     phase: game.phase,
     round: game.round,
     totalRounds: TOTAL_ROUNDS,
     question: game.question,
     players,
-    controllerId,
+    roomCode: game.roomCode,
+    hostId,
+    controllerId: hostId,
+    hostOnline: isHostOnline(game),
     submissions,
     buddy: buddyPublic(game),
     lastReveal: game.lastReveal,
@@ -249,17 +263,36 @@ export function publicState(game, viewerId = null) {
   };
 }
 
-export function getControllerId(game) {
-  const bruce = [...game.players.values()].find(
-    (p) => p.connected && p.username.trim().toLowerCase() === "bruce"
-  );
+function isBruce(username) {
+  return String(username || "").trim().toLowerCase() === "bruce";
+}
+
+/** Bruce in the room always hosts; otherwise the room creator (first joiner). */
+export function getHostId(game) {
+  const bruce = [...game.players.values()].find((p) => isBruce(p.username));
   if (bruce) return bruce.id;
-  const first = [...game.players.values()].find((p) => p.connected);
-  return first?.id ?? null;
+  if (game.creatorId && game.players.has(game.creatorId)) {
+    return game.creatorId;
+  }
+  const sorted = [...game.players.values()].sort(
+    (a, b) => (a.joinedAt || 0) - (b.joinedAt || 0)
+  );
+  return sorted[0]?.id ?? null;
+}
+
+export function getControllerId(game) {
+  return getHostId(game);
+}
+
+export function isHostOnline(game) {
+  const hostId = getHostId(game);
+  if (!hostId) return false;
+  const host = game.players.get(hostId);
+  return !!(host && host.connected);
 }
 
 export function canControl(game, userId) {
-  return getControllerId(game) === userId;
+  return !!userId && getHostId(game) === userId && isHostOnline(game);
 }
 
 export function upsertPlayer(game, { id, username, socketId }) {
@@ -270,11 +303,15 @@ export function upsertPlayer(game, { id, username, socketId }) {
     existing.socketId = socketId;
     return existing;
   }
+  if (!game.creatorId) {
+    game.creatorId = id;
+  }
   const player = {
     id,
     username,
     socketId,
     connected: true,
+    joinedAt: Date.now(),
     score: 0,
     answerHistory: [],
   };
@@ -284,13 +321,10 @@ export function upsertPlayer(game, { id, username, socketId }) {
 
 export function setDisconnected(game, socketId) {
   for (const p of game.players.values()) {
+    // Ignore stale disconnects after the player already reconnected on a new socket
     if (p.socketId === socketId) {
       p.connected = false;
       p.socketId = null;
-      // Free buddy locks involving them so the round can continue
-      if (game.phase === "buddy") {
-        unlockBuddy(game, p.id);
-      }
       return p;
     }
   }
@@ -306,7 +340,30 @@ export function kickPlayer(game, targetId) {
   clearRequestsInvolving(game, targetId);
   game.players.delete(targetId);
   game.submissions.delete(targetId);
+  reassignCreatorIfNeeded(game, targetId);
   return p;
+}
+
+/** Player leaves the room voluntarily (same cleanup as kick). */
+export function leavePlayer(game, userId) {
+  return kickPlayer(game, userId);
+}
+
+function reassignCreatorIfNeeded(game, leftId) {
+  if (game.creatorId !== leftId) return;
+  const sorted = [...game.players.values()].sort(
+    (a, b) => (a.joinedAt || 0) - (b.joinedAt || 0)
+  );
+  game.creatorId = sorted[0]?.id ?? null;
+}
+
+/** After reconnect / host returns, finish any phase that was waiting on the full roster. */
+export function reconcilePhases(game) {
+  if (!isHostOnline(game)) return;
+  if (game.phase === "answering" && game.question && allAnswerReady(game)) {
+    game.phase = "buddy";
+    game.buddy = emptyBuddy();
+  }
 }
 
 /** Drop offline leftovers from earlier sessions so they don't linger into a new game. */
@@ -405,7 +462,7 @@ export function submitAnswer(game, userId, payload) {
     buddyKind: undefined,
   });
 
-  if (allAnswerReady(game)) {
+  if (isHostOnline(game) && allAnswerReady(game)) {
     game.phase = "buddy";
     game.buddy = emptyBuddy();
   }
@@ -535,13 +592,13 @@ export function reveal(game) {
     return { ok: false, error: "wrong_phase" };
   }
   syncBuddyLinks(game);
-  const connected = connectedPlayers(game);
+  const roster = rosterPlayers(game);
   if (!allBuddyReady(game)) {
     return { ok: false, error: "not_all_ready" };
   }
 
   const counts = { A: 0, B: 0 };
-  for (const p of connected) {
+  for (const p of roster) {
     counts[game.submissions.get(p.id).answer]++;
   }
 
@@ -549,7 +606,7 @@ export function reveal(game) {
   const majoritySide = tied ? null : counts.A > counts.B ? "A" : "B";
 
   const results = {};
-  for (const p of connected) {
+  for (const p of roster) {
     const sub = game.submissions.get(p.id);
     const isMajority = !tied && sub.answer === majoritySide;
     const isMinority = !tied && sub.answer !== majoritySide;
@@ -629,7 +686,7 @@ export function reveal(game) {
   }
 
   for (const p of game.players.values()) {
-    if (!p.connected) {
+    if (!results[p.id]) {
       p.answerHistory.push(null);
     }
   }

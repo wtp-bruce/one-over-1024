@@ -359,6 +359,16 @@ input:focus {
   vertical-align: middle;
 }
 
+.badge-warn {
+  border-color: var(--pink, #ff2d6a);
+  background: color-mix(in srgb, var(--pink, #ff2d6a) 85%, black);
+  color: #fff;
+}
+
+.host-pause {
+  margin-top: 0.5rem;
+}
+
 .choice-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;

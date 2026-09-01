@@ -14,8 +14,10 @@ import {
   upsertPlayer,
   setDisconnected,
   kickPlayer,
-  pruneObsoletePlayers,
+  leavePlayer,
   canControl,
+  isHostOnline,
+  reconcilePhases,
   startGame,
   setQuestion,
   setPhysicalCard,
@@ -39,13 +41,42 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: true, credentials: true },
+  // Help reconnecting clients recover faster after brief drops
+  pingInterval: 10000,
+  pingTimeout: 20000,
 });
 
 app.use(cors({ origin: true, credentials: true }));
 app.use(cookieParser());
 app.use(express.json());
 
-const game = createGame();
+/** @type {Map<string, ReturnType<typeof createGame>>} */
+const rooms = new Map();
+
+function normalizeRoomCode(code) {
+  return String(code || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .slice(0, 8);
+}
+
+function getOrCreateRoom(roomCode, creatorId) {
+  let game = rooms.get(roomCode);
+  if (!game) {
+    game = createGame(roomCode, creatorId);
+    rooms.set(roomCode, game);
+  }
+  return game;
+}
+
+function destroyRoomIfEmpty(roomCode) {
+  const game = rooms.get(roomCode);
+  if (!game) return;
+  if (game.players.size === 0) {
+    rooms.delete(roomCode);
+  }
+}
 
 function getLanIPv4() {
   const nets = os.networkInterfaces();
@@ -57,7 +88,6 @@ function getLanIPv4() {
       }
     }
   }
-  // Prefer common home LAN ranges
   const preferred = candidates.find(
     (ip) =>
       ip.startsWith("192.168.") ||
@@ -76,9 +106,10 @@ function getPublicBaseUrl(req) {
   }
   const host = req?.get?.("host");
   if (host && !host.includes("localhost") && !host.startsWith("127.")) {
-    const protocol = req.protocol === "https" || req.get("x-forwarded-proto") === "https"
-      ? "https"
-      : "http";
+    const protocol =
+      req.protocol === "https" || req.get("x-forwarded-proto") === "https"
+        ? "https"
+        : "http";
     return { host, protocol, url: `${protocol}://${host}` };
   }
   const ip = getLanIPv4();
@@ -91,19 +122,23 @@ app.get("/api/health", (_req, res) => {
 
 app.get("/api/join-info", (req, res) => {
   const info = getPublicBaseUrl(req);
+  const room = normalizeRoomCode(req.query.room);
   const [ip, portPart] = info.host.includes(":")
     ? [info.host.split(":")[0], info.host.split(":")[1]]
     : [info.host, info.protocol === "https" ? "443" : String(PORT)];
+  const url = room ? `${info.url}?room=${encodeURIComponent(room)}` : info.url;
   res.json({
     ip,
     port: Number(portPart) || PORT,
-    url: info.url,
+    url,
+    roomCode: room || null,
   });
 });
 
 app.get("/api/qr.png", async (req, res) => {
   const info = getPublicBaseUrl(req);
-  const url = info.url;
+  const room = normalizeRoomCode(req.query.room);
+  const url = room ? `${info.url}?room=${encodeURIComponent(room)}` : info.url;
   try {
     const png = await QRCode.toBuffer(url, {
       type: "png",
@@ -129,10 +164,9 @@ app.get("/api/me", (req, res) => {
       sameSite: "lax",
     });
   }
-  const player = game.players.get(userId);
   res.json({
     userId,
-    username: player?.username ?? null,
+    username: null,
   });
 });
 
@@ -150,7 +184,11 @@ app.post("/api/me", (req, res) => {
   if (!username) {
     return res.status(400).json({ error: "username_required" });
   }
-  res.json({ userId, username });
+  const roomCode = normalizeRoomCode(req.body?.roomCode);
+  if (!roomCode) {
+    return res.status(400).json({ error: "room_required" });
+  }
+  res.json({ userId, username, roomCode });
 });
 
 const clientDist = path.join(__dirname, "../client/dist");
@@ -164,32 +202,101 @@ app.get("*", (req, res, next) => {
   });
 });
 
-function broadcast() {
+function broadcastRoom(roomCode) {
+  const game = rooms.get(roomCode);
+  if (!game) return;
   for (const sock of io.sockets.sockets.values()) {
-    sock.emit("state", publicState(game, sock.data.userId || null));
+    if (sock.data.roomCode === roomCode) {
+      sock.emit("state", publicState(game, sock.data.userId || null));
+    }
   }
 }
 
+function detachSocketFromRoom(socket, { removePlayer = false } = {}) {
+  const roomCode = socket.data.roomCode;
+  const userId = socket.data.userId;
+  if (!roomCode) return null;
+  const game = rooms.get(roomCode);
+  socket.leave(roomCode);
+  socket.data.roomCode = null;
+  if (!game) return null;
+
+  if (removePlayer && userId) {
+    leavePlayer(game, userId);
+    destroyRoomIfEmpty(roomCode);
+    if (rooms.has(roomCode)) broadcastRoom(roomCode);
+  }
+  return { game, roomCode, userId };
+}
+
+function requireRoom(socket) {
+  const roomCode = socket.data.roomCode;
+  const game = roomCode ? rooms.get(roomCode) : null;
+  if (!game || !socket.data.userId) {
+    socket.emit("error_msg", { error: "not_in_room" });
+    return null;
+  }
+  return { game, roomCode };
+}
+
+function requireHostOnline(socket, game) {
+  if (!isHostOnline(game)) {
+    socket.emit("error_msg", { error: "host_offline" });
+    return false;
+  }
+  return true;
+}
+
 io.on("connection", (socket) => {
-  socket.on("join", ({ userId, username }) => {
+  socket.on("join", ({ userId, username, roomCode }) => {
     const id = String(userId || "").trim();
     const name = String(username || "").trim().slice(0, 24);
+    const code = normalizeRoomCode(roomCode);
     if (!id || !name) {
       socket.emit("error_msg", { error: "invalid_join" });
       return;
     }
+    if (!code) {
+      socket.emit("error_msg", { error: "room_required" });
+      return;
+    }
+
+    // Moving rooms / refreshing: leave previous room roster if needed
+    if (socket.data.roomCode && socket.data.roomCode !== code) {
+      detachSocketFromRoom(socket, { removePlayer: true });
+    } else if (socket.data.roomCode === code && socket.data.userId === id) {
+      // Same room reconnect path — just refresh membership below
+    }
+
+    const game = getOrCreateRoom(code, id);
     upsertPlayer(game, { id, username: name, socketId: socket.id });
+    reconcilePhases(game);
     socket.data.userId = id;
-    broadcast();
+    socket.data.roomCode = code;
+    socket.join(code);
+    socket.emit("state", publicState(game, id));
+    broadcastRoom(code);
+  });
+
+  socket.on("leave_room", () => {
+    const roomCode = socket.data.roomCode;
+    detachSocketFromRoom(socket, { removePlayer: true });
+    socket.emit("left_room");
+    if (roomCode && rooms.has(roomCode)) {
+      broadcastRoom(roomCode);
+    }
   });
 
   socket.on("kick", ({ targetId }) => {
-    const userId = socket.data.userId;
-    if (!canControl(game, userId)) {
+    const ctx = requireRoom(socket);
+    if (!ctx) return;
+    const { game, roomCode } = ctx;
+    if (!requireHostOnline(socket, game)) return;
+    if (!canControl(game, socket.data.userId)) {
       socket.emit("error_msg", { error: "not_controller" });
       return;
     }
-    if (targetId === userId) {
+    if (targetId === socket.data.userId) {
       socket.emit("error_msg", { error: "cannot_kick_self" });
       return;
     }
@@ -197,12 +304,21 @@ io.on("connection", (socket) => {
     if (kicked?.socketId) {
       io.to(kicked.socketId).emit("kicked");
       const sock = io.sockets.sockets.get(kicked.socketId);
-      sock?.disconnect(true);
+      if (sock) {
+        sock.data.roomCode = null;
+        sock.leave(roomCode);
+        sock.disconnect(true);
+      }
     }
-    broadcast();
+    destroyRoomIfEmpty(roomCode);
+    if (rooms.has(roomCode)) broadcastRoom(roomCode);
   });
 
   socket.on("start_game", () => {
+    const ctx = requireRoom(socket);
+    if (!ctx) return;
+    const { game, roomCode } = ctx;
+    if (!requireHostOnline(socket, game)) return;
     if (!canControl(game, socket.data.userId)) {
       socket.emit("error_msg", { error: "not_controller" });
       return;
@@ -212,10 +328,14 @@ io.on("connection", (socket) => {
       socket.emit("error_msg", result);
       return;
     }
-    broadcast();
+    broadcastRoom(roomCode);
   });
 
   socket.on("physical_card", (payload) => {
+    const ctx = requireRoom(socket);
+    if (!ctx) return;
+    const { game, roomCode } = ctx;
+    if (!requireHostOnline(socket, game)) return;
     if (!canControl(game, socket.data.userId)) {
       socket.emit("error_msg", { error: "not_controller" });
       return;
@@ -225,10 +345,14 @@ io.on("connection", (socket) => {
       socket.emit("error_msg", result);
       return;
     }
-    broadcast();
+    broadcastRoom(roomCode);
   });
 
   socket.on("set_question", (payload) => {
+    const ctx = requireRoom(socket);
+    if (!ctx) return;
+    const { game, roomCode } = ctx;
+    if (!requireHostOnline(socket, game)) return;
     if (!canControl(game, socket.data.userId)) {
       socket.emit("error_msg", { error: "not_controller" });
       return;
@@ -245,10 +369,14 @@ io.on("connection", (socket) => {
       socket.emit("error_msg", result);
       return;
     }
-    broadcast();
+    broadcastRoom(roomCode);
   });
 
   socket.on("random_question", () => {
+    const ctx = requireRoom(socket);
+    if (!ctx) return;
+    const { game, roomCode } = ctx;
+    if (!requireHostOnline(socket, game)) return;
     if (!canControl(game, socket.data.userId)) {
       socket.emit("error_msg", { error: "not_controller" });
       return;
@@ -258,19 +386,27 @@ io.on("connection", (socket) => {
       socket.emit("error_msg", result);
       return;
     }
-    broadcast();
+    broadcastRoom(roomCode);
   });
 
   socket.on("submit_answer", (payload) => {
+    const ctx = requireRoom(socket);
+    if (!ctx) return;
+    const { game, roomCode } = ctx;
+    if (!requireHostOnline(socket, game)) return;
     const result = submitAnswer(game, socket.data.userId, payload || {});
     if (!result.ok) {
       socket.emit("error_msg", result);
       return;
     }
-    broadcast();
+    broadcastRoom(roomCode);
   });
 
   socket.on("buddy_request", ({ targetId, buddyGuess }) => {
+    const ctx = requireRoom(socket);
+    if (!ctx) return;
+    const { game, roomCode } = ctx;
+    if (!requireHostOnline(socket, game)) return;
     const result = requestBuddy(
       game,
       socket.data.userId,
@@ -281,19 +417,27 @@ io.on("connection", (socket) => {
       socket.emit("error_msg", result);
       return;
     }
-    broadcast();
+    broadcastRoom(roomCode);
   });
 
   socket.on("buddy_cancel_request", () => {
+    const ctx = requireRoom(socket);
+    if (!ctx) return;
+    const { game, roomCode } = ctx;
+    if (!requireHostOnline(socket, game)) return;
     const result = cancelBuddyRequest(game, socket.data.userId);
     if (!result.ok) {
       socket.emit("error_msg", result);
       return;
     }
-    broadcast();
+    broadcastRoom(roomCode);
   });
 
   socket.on("buddy_respond", ({ fromId, accept }) => {
+    const ctx = requireRoom(socket);
+    if (!ctx) return;
+    const { game, roomCode } = ctx;
+    if (!requireHostOnline(socket, game)) return;
     const result = respondBuddyRequest(
       game,
       socket.data.userId,
@@ -304,10 +448,14 @@ io.on("connection", (socket) => {
       socket.emit("error_msg", result);
       return;
     }
-    broadcast();
+    broadcastRoom(roomCode);
   });
 
   socket.on("buddy_odd_attach", ({ targetId, buddyGuess }) => {
+    const ctx = requireRoom(socket);
+    if (!ctx) return;
+    const { game, roomCode } = ctx;
+    if (!requireHostOnline(socket, game)) return;
     const result = attachOddBuddy(
       game,
       socket.data.userId,
@@ -318,19 +466,27 @@ io.on("connection", (socket) => {
       socket.emit("error_msg", result);
       return;
     }
-    broadcast();
+    broadcastRoom(roomCode);
   });
 
   socket.on("buddy_unlock", () => {
+    const ctx = requireRoom(socket);
+    if (!ctx) return;
+    const { game, roomCode } = ctx;
+    if (!requireHostOnline(socket, game)) return;
     const result = unlockBuddy(game, socket.data.userId);
     if (!result.ok) {
       socket.emit("error_msg", result);
       return;
     }
-    broadcast();
+    broadcastRoom(roomCode);
   });
 
   socket.on("reveal", () => {
+    const ctx = requireRoom(socket);
+    if (!ctx) return;
+    const { game, roomCode } = ctx;
+    if (!requireHostOnline(socket, game)) return;
     if (!canControl(game, socket.data.userId)) {
       socket.emit("error_msg", { error: "not_controller" });
       return;
@@ -340,10 +496,14 @@ io.on("connection", (socket) => {
       socket.emit("error_msg", result);
       return;
     }
-    broadcast();
+    broadcastRoom(roomCode);
   });
 
   socket.on("next_round", () => {
+    const ctx = requireRoom(socket);
+    if (!ctx) return;
+    const { game, roomCode } = ctx;
+    if (!requireHostOnline(socket, game)) return;
     if (!canControl(game, socket.data.userId)) {
       socket.emit("error_msg", { error: "not_controller" });
       return;
@@ -353,33 +513,43 @@ io.on("connection", (socket) => {
       socket.emit("error_msg", result);
       return;
     }
-    broadcast();
+    broadcastRoom(roomCode);
   });
 
   socket.on("back_to_lobby", () => {
+    const ctx = requireRoom(socket);
+    if (!ctx) return;
+    const { game, roomCode } = ctx;
+    if (!requireHostOnline(socket, game)) return;
     if (!canControl(game, socket.data.userId)) {
       socket.emit("error_msg", { error: "not_controller" });
       return;
     }
     resetToLobby(game);
-    broadcast();
+    broadcastRoom(roomCode);
   });
 
   socket.on("new_game", () => {
+    const ctx = requireRoom(socket);
+    if (!ctx) return;
+    const { game, roomCode } = ctx;
+    if (!requireHostOnline(socket, game)) return;
     if (!canControl(game, socket.data.userId)) {
       socket.emit("error_msg", { error: "not_controller" });
       return;
     }
     resetToLobby(game);
-    broadcast();
+    broadcastRoom(roomCode);
   });
 
   socket.on("disconnect", () => {
+    const roomCode = socket.data.roomCode;
+    if (!roomCode) return;
+    const game = rooms.get(roomCode);
+    if (!game) return;
+    // Only mark offline — do not remove from room (reconnect can resume)
     setDisconnected(game, socket.id);
-    if (game.phase === "lobby" || game.phase === "finished") {
-      pruneObsoletePlayers(game);
-    }
-    broadcast();
+    broadcastRoom(roomCode);
   });
 });
 

@@ -5,6 +5,24 @@ import { t } from "./i18n";
 
 const USER_COOKIE = "game_user_id";
 const THEME_KEY = "game_theme";
+const ROOM_KEY = "game_room_code";
+
+function readRoomFromUrl() {
+  try {
+    const q = new URLSearchParams(window.location.search).get("room");
+    return q ? String(q).trim().toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 8) : "";
+  } catch {
+    return "";
+  }
+}
+
+function normalizeRoomInput(value) {
+  return String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .slice(0, 8);
+}
 const THEMES = [
   {
     id: "karaoke",
@@ -84,7 +102,10 @@ export default function App() {
     return THEMES.some((t) => t.id === saved) ? saved : "karaoke";
   });
   const [userId] = useState(() => ensureUserId());
-  const [username, setUsername] = useState("");
+  const [username, setUsername] = useState(() => localStorage.getItem("username") || "");
+  const [roomCode, setRoomCode] = useState(() => {
+    return readRoomFromUrl() || localStorage.getItem(ROOM_KEY) || "";
+  });
   const [joined, setJoined] = useState(false);
   const [joining, setJoining] = useState(false);
   const [kicked, setKicked] = useState(false);
@@ -95,6 +116,11 @@ export default function App() {
   const [socket, setSocket] = useState(null);
 
   const tr = (key, vars) => t(lang, key, vars);
+  const formatError = (code) => {
+    const mapped = tr(`error_${code}`);
+    if (mapped && mapped !== `error_${code}`) return mapped;
+    return code || tr("error");
+  };
 
   useEffect(() => {
     localStorage.setItem("lang", lang);
@@ -106,74 +132,109 @@ export default function App() {
   }, [theme]);
 
   useEffect(() => {
-    fetch("/api/me", { credentials: "include" })
-      .then((r) => r.json())
-      .then((data) => {
-        if (data.username) setUsername(data.username);
-      })
-      .catch(() => {});
-    fetch("/api/join-info")
-      .then((r) => r.json())
-      .then(setJoinInfo)
-      .catch(() => {});
+    const fromUrl = readRoomFromUrl();
+    if (fromUrl) setRoomCode(fromUrl);
   }, []);
 
   useEffect(() => {
-    if (!joined || !username) return;
+    const code = normalizeRoomInput(roomCode);
+    const q = code ? `?room=${encodeURIComponent(code)}` : "";
+    fetch(`/api/join-info${q}`)
+      .then((r) => r.json())
+      .then(setJoinInfo)
+      .catch(() => {});
+  }, [joined, roomCode]);
+
+  useEffect(() => {
+    if (!joined || !username || !roomCode) return;
+    const code = normalizeRoomInput(roomCode);
     const s = io({
       withCredentials: true,
-      // Vercel WebSockets require websocket-only (no long-polling upgrade).
       transports: ["websocket"],
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 500,
+      reconnectionDelayMax: 4000,
     });
     setSocket(s);
 
-    s.on("connect", () => {
-      s.emit("join", { userId, username });
-    });
+    const emitJoin = () => {
+      s.emit("join", { userId, username, roomCode: code });
+    };
+
+    s.on("connect", emitJoin);
+    s.on("reconnect", emitJoin);
     s.on("state", (next) => {
       setState(next);
       setError("");
     });
     s.on("error_msg", (payload) => {
-      setError(payload?.error || "error");
+      setError(formatError(payload?.error || "error"));
     });
     s.on("kicked", () => {
       setKicked(true);
       setJoined(false);
       setState(null);
     });
+    s.on("left_room", () => {
+      setJoined(false);
+      setState(null);
+      setTab("play");
+    });
 
     return () => {
+      s.removeAllListeners();
       s.disconnect();
       setSocket(null);
     };
-  }, [joined, userId, username]);
+  }, [joined, userId, username, roomCode]);
 
   const me = useMemo(
     () => state?.players?.find((p) => p.id === userId),
     [state, userId]
   );
-  const isController = state?.controllerId === userId;
+  const isController = state?.controllerId === userId || state?.hostId === userId;
+  const hostOnline = state?.hostOnline !== false;
+  const hostPaused = Boolean(joined && state && !hostOnline && !isController);
 
   async function handleJoin(e) {
     e.preventDefault();
     const name = username.trim();
-    if (!name) return;
+    const code = normalizeRoomInput(roomCode);
+    if (!name || !code) return;
     setJoining(true);
     setKicked(false);
+    setError("");
     try {
-      await fetch("/api/me", {
+      const res = await fetch("/api/me", {
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: name }),
+        body: JSON.stringify({ username: name, roomCode: code }),
       });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        setError(formatError(body.error || "invalid_join"));
+        return;
+      }
       localStorage.setItem("username", name);
+      localStorage.setItem(ROOM_KEY, code);
       setUsername(name);
+      setRoomCode(code);
+      const url = new URL(window.location.href);
+      url.searchParams.set("room", code);
+      window.history.replaceState({}, "", url);
       setJoined(true);
     } finally {
       setJoining(false);
     }
+  }
+
+  function handleLeaveRoom() {
+    socket?.emit("leave_room");
+    setJoined(false);
+    setState(null);
+    setTab("play");
   }
 
   if (kicked) {
@@ -196,7 +257,7 @@ export default function App() {
         <div className="gate-inner panel">
           <div className="brand">{tr("brand")}</div>
           <p className="tagline">{tr("tagline")}</p>
-          <form className="gate form" onSubmit={handleJoin}>
+          <form className="gateform" onSubmit={handleJoin}>
             <label>
               <span className="muted">{tr("enterName")}</span>
               <input
@@ -207,7 +268,23 @@ export default function App() {
                 autoFocus
               />
             </label>
-            <button type="submit" disabled={!username.trim() || joining}>
+            <label>
+              <span className="muted">{tr("roomCode")}</span>
+              <input
+                value={roomCode}
+                onChange={(e) => setRoomCode(normalizeRoomInput(e.target.value))}
+                placeholder={tr("roomCodePlaceholder")}
+                maxLength={8}
+                autoCapitalize="characters"
+                inputMode="text"
+              />
+              <span className="meta">{tr("roomCodeHint")}</span>
+            </label>
+            {error ? <div className="error-toast">{tr("error")}: {error}</div> : null}
+            <button
+              type="submit"
+              disabled={!username.trim() || !normalizeRoomInput(roomCode) || joining}
+            >
               {joining ? tr("joining") : tr("join")}
             </button>
           </form>
@@ -228,61 +305,94 @@ export default function App() {
           <div className="brand">{tr("brand")}</div>
           <p className="tagline">
             {me ? `${tr("you")}: ${me.username}` : tr("tagline")}
+            {state?.roomCode ? (
+              <span className="badge">{tr("roomLabel", { code: state.roomCode })}</span>
+            ) : null}
             {isController ? <span className="badge">{tr("controller")}</span> : null}
+            {!hostOnline ? <span className="badge badge-warn">{tr("hostOffline")}</span> : null}
           </p>
         </div>
-        <button type="button" className="ghost" onClick={() => setLang(lang === "zh" ? "en" : "zh")}>
-          {tr("lang")}
-        </button>
+        <div className="row">
+          <button type="button" className="ghost" onClick={handleLeaveRoom}>
+            {tr("leaveRoom")}
+          </button>
+          <button type="button" className="ghost" onClick={() => setLang(lang === "zh" ? "en" : "zh")}>
+            {tr("lang")}
+          </button>
+        </div>
       </header>
 
-      <nav className="tabs">
-        {[
-          ["play", "tabPlay"],
-          ["score", "tabScore"],
-          ["similar", "tabSimilar"],
-          ["history", "tabHistory"],
-          ["theme", "tabTheme"],
-          ["join", "tabJoin"],
-          ...(isController ? [["admin", "tabAdmin"]] : []),
-        ].map(([id, key]) => (
-          <button
-            key={id}
-            type="button"
-            className={tab === id ? "active" : ""}
-            onClick={() => setTab(id)}
-          >
-            {tr(key)}
+      {hostPaused ? (
+        <div className="host-pause panel">
+          <h2 className="section-title">{tr("hostOfflineTitle")}</h2>
+          <p className="muted">{tr("hostOfflineHint")}</p>
+          <div style={{ marginTop: "1rem" }}>
+            <PlayerList
+              tr={tr}
+              state={state}
+              userId={userId}
+              isController={false}
+              socket={socket}
+              showKick={false}
+            />
+          </div>
+          <button type="button" style={{ marginTop: "1rem" }} onClick={handleLeaveRoom}>
+            {tr("leaveRoom")}
           </button>
-        ))}
-      </nav>
+        </div>
+      ) : (
+        <>
+          <nav className="tabs">
+            {[
+              ["play", "tabPlay"],
+              ["score", "tabScore"],
+              ["similar", "tabSimilar"],
+              ["history", "tabHistory"],
+              ["theme", "tabTheme"],
+              ["join", "tabJoin"],
+              ...(isController && hostOnline ? [["admin", "tabAdmin"]] : []),
+            ].map(([id, key]) => (
+              <button
+                key={id}
+                type="button"
+                className={tab === id ? "active" : ""}
+                onClick={() => setTab(id)}
+              >
+                {tr(key)}
+              </button>
+            ))}
+          </nav>
 
-      {error ? <div className="error-toast">{tr("error")}: {error}</div> : null}
+          {error ? <div className="error-toast">{tr("error")}: {error}</div> : null}
 
-      {tab === "play" && (
-        <PlayView
-          tr={tr}
-          state={state}
-          userId={userId}
-          isController={isController}
-          socket={socket}
-        />
-      )}
-      {tab === "score" && <ScoreView tr={tr} state={state} />}
-      {tab === "similar" && <SimilarView tr={tr} state={state} />}
-      {tab === "history" && <HistoryView tr={tr} state={state} />}
-      {tab === "theme" && (
-        <ThemeView tr={tr} theme={theme} onThemeChange={setTheme} />
-      )}
-      {tab === "join" && <JoinView tr={tr} joinInfo={joinInfo} />}
-      {tab === "admin" && isController && (
-        <AdminView
-          tr={tr}
-          state={state}
-          userId={userId}
-          socket={socket}
-          onNewGame={() => setTab("play")}
-        />
+          {tab === "play" && (
+            <PlayView
+              tr={tr}
+              state={state}
+              userId={userId}
+              isController={isController && hostOnline}
+              socket={socket}
+            />
+          )}
+          {tab === "score" && <ScoreView tr={tr} state={state} />}
+          {tab === "similar" && <SimilarView tr={tr} state={state} />}
+          {tab === "history" && <HistoryView tr={tr} state={state} />}
+          {tab === "theme" && (
+            <ThemeView tr={tr} theme={theme} onThemeChange={setTheme} />
+          )}
+          {tab === "join" && (
+            <JoinView tr={tr} joinInfo={joinInfo} roomCode={state?.roomCode || roomCode} />
+          )}
+          {tab === "admin" && isController && hostOnline && (
+            <AdminView
+              tr={tr}
+              state={state}
+              userId={userId}
+              socket={socket}
+              onNewGame={() => setTab("play")}
+            />
+          )}
+        </>
       )}
     </div>
   );
@@ -325,7 +435,7 @@ function PlayerList({ tr, state, userId, isController, socket, showKick }) {
               {p.username}
               {p.id === userId ? ` (${tr("you")})` : ""}
             </strong>
-            {state.controllerId === p.id ? (
+            {(state.hostId || state.controllerId) === p.id ? (
               <span className="badge">{tr("controller")}</span>
             ) : null}
             <div className="meta">
@@ -1224,13 +1334,15 @@ function SimilarView({ tr, state }) {
   );
 }
 
-function JoinView({ tr, joinInfo }) {
+function JoinView({ tr, joinInfo, roomCode }) {
   const [copied, setCopied] = useState(false);
-  const url =
-    joinInfo?.url ||
+  const code = normalizeRoomInput(roomCode || joinInfo?.roomCode || "");
+  const base =
+    joinInfo?.url?.split("?")[0] ||
     (joinInfo?.ip
       ? `http://${joinInfo.ip}:${window.location.port || joinInfo.port || 4173}`
       : window.location.origin);
+  const url = code ? `${base}?room=${encodeURIComponent(code)}` : joinInfo?.url || base;
 
   async function copy() {
     try {
@@ -1246,6 +1358,11 @@ function JoinView({ tr, joinInfo }) {
     <section className="panel">
       <h2 className="section-title">{tr("joinUrl")}</h2>
       <p className="muted">{tr("scanQr")}</p>
+      {code ? (
+        <p>
+          {tr("roomLabel", { code })}
+        </p>
+      ) : null}
       <div className="qr-wrap">
         <div className="qr-frame">
           <QRCodeSVG value={url} size={220} level="M" />
